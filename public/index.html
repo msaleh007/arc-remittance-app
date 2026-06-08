@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Arc Remittance — Send USDC Cross-Border</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; font-family: -apple-system, system-ui, sans-serif; }
+  body { background: #0d1117; color: #e6edf3; display: flex; justify-content: center; padding: 40px 16px; min-height: 100vh; }
+  .app { width: 100%; max-width: 440px; }
+  .logo { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .logo h1 { font-size: 22px; font-weight: 600; }
+  .sub { color: #8b949e; font-size: 14px; margin-bottom: 28px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 14px; padding: 24px; margin-bottom: 16px; }
+  .wallet { display: flex; justify-content: space-between; font-size: 13px; color: #8b949e; margin-bottom: 4px; }
+  .wallet b { color: #e6edf3; }
+  label { display: block; font-size: 13px; color: #8b949e; margin: 16px 0 6px; }
+  input { width: 100%; background: #0d1117; border: 1px solid #30363d; border-radius: 8px; padding: 12px; color: #e6edf3; font-size: 16px; }
+  input:focus { outline: none; border-color: #1f6feb; }
+  .quote { background: #0d1117; border-radius: 8px; padding: 14px; margin-top: 16px; font-size: 14px; }
+  .quote .row { display: flex; justify-content: space-between; margin: 6px 0; color: #8b949e; }
+  .quote .row.total { color: #e6edf3; font-weight: 600; border-top: 1px solid #30363d; padding-top: 10px; margin-top: 10px; }
+  button { width: 100%; background: #238636; color: #fff; border: none; border-radius: 8px; padding: 14px; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 18px; }
+  button:disabled { background: #30363d; color: #8b949e; cursor: not-allowed; }
+  .status { font-size: 13px; margin-top: 16px; padding: 12px; border-radius: 8px; word-break: break-all; }
+  .status.ok { background: #0f2417; color: #56d364; border: 1px solid #238636; }
+  .status.err { background: #2d1416; color: #f85149; border: 1px solid #da3633; }
+  .status a { color: #58a6ff; }
+  .flow { display: flex; gap: 6px; margin-top: 14px; font-size: 11px; color: #8b949e; }
+  .flow span { flex: 1; text-align: center; background: #0d1117; padding: 6px; border-radius: 6px; }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="logo">
+    <h1>Arc Remittance</h1>
+  </div>
+  <p class="sub">Send USDC cross-border instantly via Circle CCTP on Arc</p>
+
+  <div class="card">
+    <div class="wallet">
+      <span>Sender wallet</span>
+      <b id="addr">loading…</b>
+    </div>
+    <div class="wallet">
+      <span>Available USDC</span>
+      <b id="bal">—</b>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Recipient address (Arc)</label>
+    <input id="recipient" placeholder="0x... (leave empty to send to self)">
+
+    <label>Amount (USDC)</label>
+    <input id="amount" type="number" placeholder="0.00" oninput="updateQuote()">
+
+    <div class="quote" id="quote" style="display:none">
+      <div class="row"><span>You send</span><span id="qSend">0</span> USDC</div>
+      <div class="row"><span>Bridge fee (CCTP)</span><span id="qFee">0</span> USDC</div>
+      <div class="row"><span>Est. network gas</span><span id="qGas">0</span></div>
+      <div class="row total"><span>Recipient gets</span><span id="qGet">0</span> USDC</div>
+    </div>
+
+    <div class="flow">
+      <span>Approve</span><span>Burn</span><span>Attest</span><span>Mint on Arc</span>
+    </div>
+
+    <button id="sendBtn" onclick="sendMoney()">Send USDC</button>
+    <div id="status"></div>
+  </div>
+</div>
+
+<script>
+const API = '';
+
+async function loadWallet() {
+  try {
+    const r = await fetch(API + '/api/wallet');
+    const d = await r.json();
+    document.getElementById('addr').textContent = d.address.slice(0,6) + '…' + d.address.slice(-4);
+    document.getElementById('bal').textContent = parseFloat(d.usdc).toFixed(2) + ' USDC';
+  } catch (e) {
+    document.getElementById('addr').textContent = 'backend offline';
+  }
+}
+
+async function updateQuote() {
+  const amount = parseFloat(document.getElementById('amount').value);
+  const q = document.getElementById('quote');
+  if (!amount || amount <= 0) { q.style.display = 'none'; return; }
+  const r = await fetch(API + '/api/quote', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ amount })
+  });
+  const d = await r.json();
+  q.style.display = 'block';
+  document.getElementById('qSend').textContent = d.amount;
+  document.getElementById('qFee').textContent = d.bridgeFee;
+  document.getElementById('qGas').textContent = '~$' + d.estGas;
+  document.getElementById('qGet').textContent = d.receives;
+}
+
+async function sendMoney() {
+  const amount = document.getElementById('amount').value;
+  const recipient = document.getElementById('recipient').value;
+  const btn = document.getElementById('sendBtn');
+  const status = document.getElementById('status');
+
+  if (!amount || parseFloat(amount) <= 0) {
+    status.className = 'status err'; status.textContent = 'Enter a valid amount';
+    return;
+  }
+
+  btn.disabled = true; btn.textContent = 'Sending… (approve + burn)';
+  status.className = ''; status.textContent = '';
+
+  try {
+    const r = await fetch(API + '/api/send', {
+      method: 'POST', headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({ amount, recipient })
+    });
+    const d = await r.json();
+    if (d.ok) {
+      status.className = 'status ok';
+      status.innerHTML = 'Sent! USDC burned on Sepolia.<br>' +
+        'Burn tx: ' + d.burnTx.slice(0,10) + '…<br>' + d.message;
+      loadWallet();
+    } else {
+      status.className = 'status err';
+      status.textContent = 'Error: ' + d.error;
+    }
+  } catch (e) {
+    status.className = 'status err';
+    status.textContent = 'Error: ' + e.message;
+  }
+  btn.disabled = false; btn.textContent = 'Send USDC';
+}
+
+loadWallet();
+</script>
+</body>
+</html>
