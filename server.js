@@ -1,8 +1,14 @@
 // ============================================================
 //  ARC REMITTANCE APP - Backend Server
-//  USDC cross-chain transfer (Sepolia -> Arc) via Circle CCTP
+//  USDC cross-chain transfer (Sepolia -> Arc) via Circle CCTP V2
 //  Built for the Stablecoins Commerce Stack Challenge (Track 1)
-//  Backend logic based on a proven, working CCTP integration.
+//
+//  Endpoints are SPLIT so no single request runs long enough to
+//  hit Render's request timeout:
+//    POST /api/approve  -> approve USDC allowance
+//    POST /api/burn     -> depositForBurn on Sepolia
+//    POST /api/attest   -> poll Circle Iris for attestation (one check)
+//    POST /api/mint     -> receiveMessage on Arc
 // ============================================================
 
 require('dotenv').config();
@@ -73,8 +79,9 @@ const mintAbi = [{
   outputs: []
 }];
 
+// address -> bytes32 (left-pad with zeros, lowercase-safe)
 function toBytes32(addr) {
-  return ('0x000000000000000000000000' + addr.slice(2));
+  return '0x000000000000000000000000' + addr.slice(2).toLowerCase();
 }
 
 // ============ API: wallet + balance ============
@@ -85,7 +92,10 @@ app.get('/api/wallet', async (req, res) => {
       functionName: 'balanceOf', args: [account.address]
     });
     res.json({ address: account.address, usdc: formatUnits(balance, 6) });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+  } catch (e) {
+    console.error('[WALLET] ERROR:', e);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // ============ API: transparent quote ============
@@ -94,15 +104,10 @@ app.post('/api/quote', (req, res) => {
   res.json({ amount, bridgeFee: 0, estGas: 0.02, receives: amount, total: amount });
 });
 
-// ============ API: full transfer (approve -> burn -> attest -> mint) ============
-app.post('/api/send', async (req, res) => {
+// ============ STEP 1: approve ============
+app.post('/api/approve', async (req, res) => {
   try {
-    const { amount, recipient } = req.body;
-    const value = parseUnits(String(amount), 6);
-    const dest = recipient && recipient.length === 42 ? recipient : account.address;
-    const maxFee = 500n;
-
-    // Step 1: approve (10 USDC allowance, like the working script)
+    console.log('[APPROVE] start');
     const approveTx = await sepoliaClient.sendTransaction({
       to: ETHEREUM_SEPOLIA_USDC,
       data: encodeFunctionData({
@@ -111,8 +116,23 @@ app.post('/api/send', async (req, res) => {
       })
     });
     await sepoliaPublic.waitForTransactionReceipt({ hash: approveTx });
+    console.log('[APPROVE] done:', approveTx);
+    res.json({ ok: true, approveTx });
+  } catch (e) {
+    console.error('[APPROVE] ERROR:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
-    // Step 2: burn (depositForBurn) - full 7 args
+// ============ STEP 2: burn (depositForBurn) ============
+app.post('/api/burn', async (req, res) => {
+  try {
+    const { amount, recipient } = req.body;
+    const value = parseUnits(String(amount), 6);
+    const dest = recipient && recipient.length === 42 ? recipient : account.address;
+    const maxFee = 500n;
+    console.log('[BURN] start - amount:', amount, 'dest:', dest);
+
     const burnTx = await sepoliaClient.sendTransaction({
       to: ETHEREUM_SEPOLIA_TOKEN_MESSENGER,
       data: encodeFunctionData({
@@ -129,35 +149,61 @@ app.post('/api/send', async (req, res) => {
       })
     });
     await sepoliaPublic.waitForTransactionReceipt({ hash: burnTx });
+    console.log('[BURN] done:', burnTx);
+    res.json({ ok: true, burnTx, recipient: dest });
+  } catch (e) {
+    console.error('[BURN] ERROR:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
-    // Step 3: retrieve attestation
+// ============ STEP 3: attest (one poll per request) ============
+// Frontend should call this repeatedly until ok:true & ready:true.
+app.post('/api/attest', async (req, res) => {
+  try {
+    const { burnTx } = req.body;
+    if (!burnTx) return res.status(400).json({ ok: false, error: 'burnTx required' });
+
     const url = `https://iris-api-sandbox.circle.com/v2/messages/${ETHEREUM_SEPOLIA_DOMAIN}?transactionHash=${burnTx}`;
-    let attestation = null;
-    for (let i = 0; i < 30; i++) {
-      const r = await fetch(url);
-      if (r.ok) {
-        const data = await r.json();
-        if (data?.messages?.[0]?.status === 'complete') { attestation = data.messages[0]; break; }
-      }
-      await new Promise(res => setTimeout(res, 5000));
+    const r = await fetch(url);
+    if (!r.ok) {
+      return res.json({ ok: true, ready: false, message: 'Attestation not indexed yet, keep polling.' });
     }
-    if (!attestation) {
-      return res.json({ ok: true, approveTx, burnTx, minted: false,
-        message: 'Burned on Sepolia. Attestation still pending — mint will follow.' });
-    }
+    const data = await r.json();
+    const msg = data?.messages?.[0];
 
-    // Step 4: mint on Arc
+    // V2: attestation is "PENDING" until ready; message is "0x" until ready
+    const ready = msg && msg.attestation && msg.attestation !== 'PENDING' && msg.message && msg.message !== '0x';
+    if (ready) {
+      console.log('[ATTEST] ready for', burnTx);
+      return res.json({ ok: true, ready: true, message: msg.message, attestation: msg.attestation });
+    }
+    res.json({ ok: true, ready: false, message: 'Attestation still pending.' });
+  } catch (e) {
+    console.error('[ATTEST] ERROR:', e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ============ STEP 4: mint on Arc ============
+app.post('/api/mint', async (req, res) => {
+  try {
+    const { message, attestation } = req.body;
+    if (!message || !attestation) {
+      return res.status(400).json({ ok: false, error: 'message and attestation required' });
+    }
+    console.log('[MINT] start');
     const mintTx = await arcClient.sendTransaction({
       to: ARC_TESTNET_MESSAGE_TRANSMITTER,
       data: encodeFunctionData({
         abi: mintAbi, functionName: 'receiveMessage',
-        args: [attestation.message, attestation.attestation]
+        args: [message, attestation]
       })
     });
-
-    res.json({ ok: true, approveTx, burnTx, mintTx, minted: true, recipient: dest,
-      message: 'Transfer complete! USDC minted on Arc Testnet.' });
+    console.log('[MINT] done:', mintTx);
+    res.json({ ok: true, mintTx, minted: true, message: 'USDC minted on Arc Testnet!' });
   } catch (e) {
+    console.error('[MINT] ERROR:', e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
