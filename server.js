@@ -65,9 +65,6 @@ const burnAbi = [{
     { name: 'destinationCaller', type: 'bytes32' },
     { name: 'maxFee', type: 'uint256' },
     { name: 'minFinalityThreshold', type: 'uint32' },
-    { name: 'destinationCaller', type: 'bytes32' },
-    { name: 'maxFee', type: 'uint256' },
-    { name: 'minFinalityThreshold', type: 'uint32' }
   ], outputs: []
 }];
 const mintAbi = [{
